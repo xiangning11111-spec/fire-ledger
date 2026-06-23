@@ -1,0 +1,12 @@
+{
+  "name": "fire-ledger",
+  "version": "1.0.0",
+  "description": "FIRE记账 - 前端+后端一体化部署",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
