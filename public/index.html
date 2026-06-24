@@ -1057,7 +1057,55 @@ if (!appData.myCode) {
 var API_BASE = window.location.origin;
 var cloudToken = localStorage.getItem('fireToken') || '';
 var cloudUser = localStorage.getItem('fireUser') || '';
+var cloudPwd = localStorage.getItem('firePwd') || '';  // 保存密码用于自动重登录
 var cloudAvailable = false; // 是否有云端后端可用
+
+// 自动静默重登录（token失效时调用，不弹出登录界面）
+function silentReLogin() {
+  if (!cloudUser || !cloudPwd) {
+    // 没有保存的账号密码，只能弹出登录界面
+    cloudToken = '';
+    localStorage.removeItem('fireToken');
+    showAuthOverlay();
+    document.getElementById('authError').textContent = '登录已过期，请重新登录';
+    return Promise.resolve(false);
+  }
+  // 先尝试登录
+  return CloudSync.login(cloudUser, cloudPwd).then(function(d) {
+    if (d.success) {
+      cloudToken = d.token;
+      localStorage.setItem('fireToken', cloudToken);
+      if (d.partner) appData.partnerCode = d.partner;
+      saveData(appData);
+      showSyncIndicator('idle', '已自动恢复登录');
+      setTimeout(function() { hideSyncIndicator(); }, 2000);
+      return true;
+    }
+    // 登录失败（服务器重启清空了用户数据）→ 自动重新注册
+    return CloudSync.register(cloudUser, cloudPwd).then(function(d2) {
+      if (d2.success) {
+        cloudToken = d2.token;
+        localStorage.setItem('fireToken', cloudToken);
+        saveData(appData);
+        showSyncIndicator('idle', '已自动恢复账号');
+        setTimeout(function() { hideSyncIndicator(); }, 2000);
+        return true;
+      }
+      // 注册也失败 → 弹出登录界面
+      cloudToken = '';
+      localStorage.removeItem('fireToken');
+      showAuthOverlay();
+      document.getElementById('authError').textContent = '请重新登录';
+      return false;
+    });
+  }).catch(function() {
+    cloudToken = '';
+    localStorage.removeItem('fireToken');
+    showAuthOverlay();
+    document.getElementById('authError').textContent = '网络连接失败';
+    return false;
+  });
+}
 
 var CloudSync = {
   isLoggedIn: function() { return !!cloudToken && cloudAvailable; },
@@ -1098,22 +1146,29 @@ var CloudSync = {
   syncUp: function() {
     if (!cloudToken) return Promise.resolve();
     showSyncIndicator('up', '同步↑');
+    var syncBody = JSON.stringify({
+      records: appData.records,
+      netAssets: { deposit: appData.assets.length ? appData.assets[appData.assets.length-1].amount : 0, investments: appData.investments || [], lastUpdate: appData.assets.length ? appData.assets[appData.assets.length-1].date : '' },
+      config: appData.config
+    });
     return fetch(API_BASE + '/api/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cloudToken },
-      body: JSON.stringify({
-        records: appData.records,
-        netAssets: { deposit: appData.assets.length ? appData.assets[appData.assets.length-1].amount : 0, investments: appData.investments || [], lastUpdate: appData.assets.length ? appData.assets[appData.assets.length-1].date : '' },
-        config: appData.config
-      })
+      body: syncBody
     }).then(function(r) {
       if (r.status === 401) {
-        // 登录过期 → 清除token，提示重新登录
-        cloudToken = '';
-        localStorage.removeItem('fireToken');
-        showAuthOverlay();
-        document.getElementById('authError').textContent = '登录已过期，请重新登录';
-        return { success: false, expired: true };
+        // token失效 → 自动静默重登录，然后重新上传
+        showSyncIndicator('idle', '恢复登录...');
+        return silentReLogin().then(function(ok) {
+          if (ok) {
+            return fetch(API_BASE + '/api/sync', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cloudToken },
+              body: syncBody
+            }).then(function(r2) { return r2.json(); });
+          }
+          return { success: false, expired: true };
+        });
       }
       return r.json();
     }).then(function(d) {
@@ -1131,17 +1186,21 @@ var CloudSync = {
       headers: { 'Authorization': 'Bearer ' + cloudToken }
     }).then(function(r) {
       if (r.status === 401) {
-        // 登录已过期（服务器重启等原因）→ 清除本地token，提示重新登录
-        cloudToken = '';
-        localStorage.removeItem('fireToken');
-        showAuthOverlay();
-        document.getElementById('authError').textContent = '登录已过期，请重新登录';
-        showSyncIndicator('error', '登录过期');
-        return { success: false, expired: true };
+        // token失效 → 自动静默重登录
+        showSyncIndicator('idle', '恢复登录...');
+        return silentReLogin().then(function(ok) {
+          if (ok) {
+            // 重登录成功 → 重新拉取数据
+            return fetch(API_BASE + '/api/sync', {
+              headers: { 'Authorization': 'Bearer ' + cloudToken }
+            }).then(function(r2) { return r2.json(); });
+          }
+          return { success: false, expired: true };
+        });
       }
       return r.json();
     }).then(function(d) {
-      if (d.expired) return d; // 已处理过期
+      if (d.expired) return d; // 重登录也失败，已弹出登录界面
       if (d.success) {
         // 云端有数据且本地空 → 下载
         if (d.records && d.records.length > 0 && appData.records.length === 0) {
@@ -1171,21 +1230,60 @@ var CloudSync = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cloudToken },
       body: JSON.stringify({ partnerCode: partnerCode })
-    }).then(function(r) { return r.json(); });
+    }).then(function(r) {
+      if (r.status === 401) {
+        return silentReLogin().then(function(ok) {
+          if (ok) {
+            return fetch(API_BASE + '/api/bind', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cloudToken },
+              body: JSON.stringify({ partnerCode: partnerCode })
+            }).then(function(r2) { return r2.json(); });
+          }
+          return { success: false, error: '登录已过期，请重新登录' };
+        });
+      }
+      return r.json();
+    });
   },
 
   unbindPartner: function() {
     return fetch(API_BASE + '/api/unbind', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cloudToken }
-    }).then(function(r) { return r.json(); });
+    }).then(function(r) {
+      if (r.status === 401) {
+        return silentReLogin().then(function(ok) {
+          if (ok) {
+            return fetch(API_BASE + '/api/unbind', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cloudToken }
+            }).then(function(r2) { return r2.json(); });
+          }
+          return { success: false, error: '登录已过期' };
+        });
+      }
+      return r.json();
+    });
   },
 
   getPartnerStats: function() {
     if (!cloudToken) return Promise.resolve(null);
     return fetch(API_BASE + '/api/partner/stats', {
       headers: { 'Authorization': 'Bearer ' + cloudToken }
-    }).then(function(r) { return r.json(); }).catch(function() { return null; });
+    }).then(function(r) {
+      if (r.status === 401) {
+        return silentReLogin().then(function(ok) {
+          if (ok) {
+            return fetch(API_BASE + '/api/partner/stats', {
+              headers: { 'Authorization': 'Bearer ' + cloudToken }
+            }).then(function(r2) { return r2.json(); });
+          }
+          return null;
+        });
+      }
+      return r.json();
+    }).catch(function() { return null; });
   }
 };
 
@@ -1249,8 +1347,10 @@ function doLogin() {
     if (d.success) {
       cloudToken = d.token;
       cloudUser = d.username;
+      cloudPwd = password;  // 保存密码用于自动重登录
       localStorage.setItem('fireToken', cloudToken);
       localStorage.setItem('fireUser', cloudUser);
+      localStorage.setItem('firePwd', cloudPwd);
       appData.myCode = username;
       if (d.partner) appData.partnerCode = d.partner;
       saveData(appData);
@@ -1279,8 +1379,10 @@ function doRegister() {
     if (d.success) {
       cloudToken = d.token;
       cloudUser = d.username;
+      cloudPwd = password;  // 保存密码用于自动重登录
       localStorage.setItem('fireToken', cloudToken);
       localStorage.setItem('fireUser', cloudUser);
+      localStorage.setItem('firePwd', cloudPwd);
       appData.myCode = username;
       saveData(appData);
       // 上传本地数据到云端
@@ -3166,33 +3268,47 @@ function parseCsvRecords(raw) {
 function init() {
   // 先检测云端后端是否可用
   CloudSync.checkAvailable().then(function(available) {
-    if (available && !CloudSync.isLoggedIn()) {
-      // 有后端但未登录 → 显示登录界面
-      showAuthOverlay();
+    if (!available) {
+      // 无后端 → 离线模式直接初始化
+      startAppUI();
       return;
     }
 
-    // 已登录 → 先同步云端数据，确保拿到最新partner信息
-    var syncPromise = CloudSync.isLoggedIn() ? CloudSync.syncDown() : Promise.resolve();
+    if (CloudSync.isLoggedIn()) {
+      // 已有有效token → 直接同步数据
+      CloudSync.syncDown().then(function() {
+        startAppUI();
+      });
+      return;
+    }
 
-    syncPromise.then(function() {
-      // 同步完成后才初始化UI（此时partnerCode已是最新值）
-      document.getElementById('recordDate').value = new Date().toISOString().slice(0,10);
-      document.getElementById('myCode').textContent = CloudSync.isLoggedIn() ? cloudUser : appData.myCode;
-      renderCategories();
-      initFilterCategories();
-      refreshOverview();
-    });
+    // 后端可用但没有有效token → 检查是否有保存的账号密码可以自动登录
+    if (cloudUser && cloudPwd) {
+      silentReLogin().then(function(ok) {
+        if (ok) {
+          // 自动重登录成功 → 同步数据
+          CloudSync.syncDown().then(function() {
+            startAppUI();
+          });
+        } else {
+          // 自动重登录也失败 → 弹出登录界面
+          showAuthOverlay();
+        }
+      });
+      return;
+    }
 
+    // 没有保存的账号密码 → 显示登录界面
+    showAuthOverlay();
+  });
+
+  // 注册事件监听（不依赖云端状态）
   document.getElementById('assetInput').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') saveAsset();
   });
-  // 编辑弹窗类型切换时更新分类
   document.getElementById('editType').addEventListener('change', function() {
     onEditTypeChange(this.value);
   });
-
-  // 点击遮罩关闭弹窗
   document.getElementById('editModal').addEventListener('click', function(e) { if (e.target === this) hideEditModal(); });
   document.getElementById('deleteModal').addEventListener('click', function(e) { if (e.target === this) hideDeleteModal(); });
   document.getElementById('helpModal').addEventListener('click', function(e) { if (e.target === this) hideHelpModal(); });
@@ -3200,7 +3316,15 @@ function init() {
   document.getElementById('importModal').addEventListener('click', function(e) { if (e.target === this) hideImportModal(); });
   document.getElementById('monthDaysHelpModal').addEventListener('click', function(e) { if (e.target === this) hideMonthDaysHelpModal(); });
   document.getElementById('estimateHelpModal').addEventListener('click', function(e) { if (e.target === this) hideEstimateHelpModal(); });
-  });
+}
+
+// 初始化界面UI
+function startAppUI() {
+  document.getElementById('recordDate').value = new Date().toISOString().slice(0,10);
+  document.getElementById('myCode').textContent = CloudSync.isLoggedIn() ? cloudUser : appData.myCode;
+  renderCategories();
+  initFilterCategories();
+  refreshOverview();
 }
 
 window.onload = init;
