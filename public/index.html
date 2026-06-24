@@ -717,12 +717,23 @@ body{background:#0f0f23;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
     <button class="copy-btn" onclick="copyCode()">复制邀请码</button>
     <div class="tip-text">你的用户名就是邀请码，发给对象让对方输入即可绑定</div>
   </div>
-  <div class="card">
+
+  <!-- 已绑定状态 -->
+  <div id="bindStatusCard" class="card" style="display:none;background:#1a1a2e;border:1px solid #4caf8d">
+    <div class="card-title" style="color:#4caf8d">✅ 已绑定</div>
+    <div style="text-align:center;font-size:14px;color:#e0e0e0;margin-bottom:8px">你和 <span id="bindPartnerName" style="color:#4caf8d;font-weight:bold"></span> 已互相绑定</div>
+    <div style="text-align:center;font-size:12px;color:#8888aa;margin-bottom:12px">双方都能看到对方的收支概览和分类统计</div>
+    <button onclick="unbindPartner()" style="background:none;border:1px solid #e94560;color:#e94560;font-size:12px;cursor:pointer;border-radius:8px;padding:8px 20px;font-family:inherit">解除绑定</button>
+  </div>
+
+  <!-- 未绑定状态 - 输入对方邀请码 -->
+  <div id="bindInputCard" class="card">
     <div class="card-title">输入对方邀请码</div>
     <input type="text" class="code-input" id="partnerCodeInput" placeholder="输入对方的用户名（邀请码）">
     <br><br>
     <button class="bind-action-btn" onclick="bindPartner()">绑定</button>
   </div>
+
 </div>
 
 <!-- 资产录入弹窗（存款/投资双模式） -->
@@ -1375,9 +1386,19 @@ function switchTab(tab) {
   });
   if (tab === 'overview') refreshOverview();
   if (tab === 'fire') refreshFire();
-  if (tab === 'shared') refreshShared();
+  // 切到共同/绑定页时先同步云端partner信息，确保显示最新状态
+  if (tab === 'shared' || tab === 'bind') {
+    if (CloudSync.isLoggedIn()) {
+      CloudSync.syncDown().then(function() {
+        if (tab === 'shared') refreshShared();
+        if (tab === 'bind') refreshBind();
+      });
+    } else {
+      if (tab === 'shared') refreshShared();
+      if (tab === 'bind') refreshBind();
+    }
+  }
   if (tab === 'record') refreshRecord();
-  if (tab === 'bind') refreshBind();
 }
 
 // ============ 总览页 ============
@@ -2896,6 +2917,12 @@ function refreshShared() {
 // ============ 绑定页 ============
 function refreshBind() {
   document.getElementById('myCode').textContent = CloudSync.isLoggedIn() ? cloudUser : appData.myCode;
+  var hasPartner = !!appData.partnerCode;
+  document.getElementById('bindStatusCard').style.display = hasPartner ? 'block' : 'none';
+  document.getElementById('bindInputCard').style.display = hasPartner ? 'none' : 'block';
+  if (hasPartner) {
+    document.getElementById('bindPartnerName').textContent = appData.partnerCode;
+  }
 }
 
 function copyCode() {
@@ -2928,6 +2955,7 @@ function bindPartner() {
       appData.partnerCode = code;
       saveData(appData);
       alert('绑定成功！你和 ' + code + ' 已经连接了');
+      refreshBind();
       refreshShared();
       switchTab('shared');
     } else {
@@ -3144,16 +3172,17 @@ function init() {
       return;
     }
 
-    // 已登录或无后端 → 正常初始化
-    if (CloudSync.isLoggedIn()) {
-      CloudSync.syncDown();
-    }
+    // 已登录 → 先同步云端数据，确保拿到最新partner信息
+    var syncPromise = CloudSync.isLoggedIn() ? CloudSync.syncDown() : Promise.resolve();
 
-    document.getElementById('recordDate').value = new Date().toISOString().slice(0,10);
-    document.getElementById('myCode').textContent = CloudSync.isLoggedIn() ? cloudUser : appData.myCode;
-    renderCategories();
-    initFilterCategories();
-    refreshOverview();
+    syncPromise.then(function() {
+      // 同步完成后才初始化UI（此时partnerCode已是最新值）
+      document.getElementById('recordDate').value = new Date().toISOString().slice(0,10);
+      document.getElementById('myCode').textContent = CloudSync.isLoggedIn() ? cloudUser : appData.myCode;
+      renderCategories();
+      initFilterCategories();
+      refreshOverview();
+    });
 
   document.getElementById('assetInput').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') saveAsset();
