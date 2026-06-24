@@ -289,7 +289,7 @@ body{background:#0f0f23;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
       <input id="loginUser" class="auth-input" placeholder="用户名" autocomplete="username">
       <input id="loginPwd" class="auth-input" type="password" placeholder="密码" autocomplete="current-password">
       <button class="auth-btn" onclick="doLogin()">登录</button>
-      <div class="auth-switch">没有账号？<a onclick="showRegister()">注册新账号</a></div>
+      <div class="auth-switch">没有账号？<a onclick="showRegister()">注册新账号</a> | <a onclick="showResetPwd()">忘记密码？</a></div>
     </div>
     <!-- 注册 -->
     <div id="authRegisterForm" style="display:none">
@@ -298,6 +298,14 @@ body{background:#0f0f23;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
       <input id="regPwd2" class="auth-input" type="password" placeholder="确认密码" autocomplete="new-password">
       <button class="auth-btn" onclick="doRegister()">注册</button>
       <div class="auth-switch">已有账号？<a onclick="showLogin()">去登录</a></div>
+    </div>
+    <!-- 重置密码 -->
+    <div id="authResetForm" style="display:none">
+      <input id="resetUser" class="auth-input" placeholder="用户名" autocomplete="username">
+      <input id="resetPwd" class="auth-input" type="password" placeholder="新密码（至少4位）" autocomplete="new-password">
+      <input id="resetPwd2" class="auth-input" type="password" placeholder="确认新密码" autocomplete="new-password">
+      <button class="auth-btn" onclick="doResetPwd()">重置密码</button>
+      <div class="auth-switch">已想起密码？<a onclick="showLogin()">去登录</a></div>
     </div>
     <!-- 离线模式提示 -->
     <div style="text-align:center;margin-top:12px;font-size:11px;color:#555">
@@ -1306,6 +1314,7 @@ function hideSyncIndicator() {
 function showAuthOverlay() {
   document.getElementById('authOverlay').style.display = 'flex';
   document.getElementById('authError').textContent = '';
+  document.getElementById('authResetForm').style.display = 'none';
   showLogin();
 }
 function hideAuthOverlay() {
@@ -1328,14 +1337,62 @@ function skipAuth() {
 function showLogin() {
   document.getElementById('authLoginForm').style.display = 'block';
   document.getElementById('authRegisterForm').style.display = 'none';
+  document.getElementById('authResetForm').style.display = 'none';
   document.getElementById('authSubtitle').textContent = '登录后数据自动云端同步，不怕丢失';
   document.getElementById('authError').textContent = '';
 }
 function showRegister() {
   document.getElementById('authLoginForm').style.display = 'none';
   document.getElementById('authRegisterForm').style.display = 'block';
+  document.getElementById('authResetForm').style.display = 'none';
   document.getElementById('authSubtitle').textContent = '用户名就是你的邀请码，告诉对象就能绑定';
   document.getElementById('authError').textContent = '';
+}
+function showResetPwd() {
+  document.getElementById('authLoginForm').style.display = 'none';
+  document.getElementById('authRegisterForm').style.display = 'none';
+  document.getElementById('authResetForm').style.display = 'block';
+  document.getElementById('authSubtitle').textContent = '输入用户名和新密码即可重置';
+  document.getElementById('authError').textContent = '';
+}
+function doResetPwd() {
+  var username = document.getElementById('resetUser').value.trim();
+  var newPwd = document.getElementById('resetPwd').value;
+  var newPwd2 = document.getElementById('resetPwd2').value;
+  if (!username || !newPwd) { document.getElementById('authError').textContent = '请输入用户名和新密码'; return; }
+  if (newPwd !== newPwd2) { document.getElementById('authError').textContent = '两次密码不一致'; return; }
+
+  fetch(API_BASE + '/api/auth/reset-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: username, newPassword: newPwd })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.success) {
+      // 重置成功 → 自动用新密码登录
+      cloudPwd = newPwd;
+      localStorage.setItem('firePwd', cloudPwd);
+      CloudSync.login(username, newPwd).then(function(d2) {
+        if (d2.success) {
+          cloudToken = d2.token;
+          cloudUser = d2.username;
+          localStorage.setItem('fireToken', cloudToken);
+          localStorage.setItem('fireUser', cloudUser);
+          appData.myCode = username;
+          if (d2.partner) appData.partnerCode = d2.partner;
+          saveData(appData);
+          hideAuthOverlay();
+          CloudSync.syncDown().then(function() { refreshAll(); });
+        } else {
+          showLogin();
+          document.getElementById('authError').textContent = '密码已重置，请手动登录';
+        }
+      });
+    } else {
+      document.getElementById('authError').textContent = d.error || '重置失败';
+    }
+  }).catch(function() {
+    document.getElementById('authError').textContent = '网络连接失败';
+  });
 }
 
 function doLogin() {

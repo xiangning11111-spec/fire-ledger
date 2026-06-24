@@ -87,6 +87,23 @@ app.post('/api/auth/login', (req, res) => {
   res.json({ success: true, token, username, inviteCode: username, partner: user.partner });
 });
 
+// 密码重置（输入用户名 + 新密码即可重置，不需要旧密码）
+app.post('/api/auth/reset-password', (req, res) => {
+  const { username, newPassword } = req.body;
+  if (!username || !newPassword) return res.status(400).json({ error: '请输入用户名和新密码' });
+  if (newPassword.length < 4) return res.status(400).json({ error: '新密码至少4位' });
+  const db = readDB();
+  const user = db.users[username];
+  if (!user) return res.status(400).json({ error: '该用户名不存在' });
+  user.password = hashPassword(newPassword);
+  // 清除该用户的所有旧session，强制重新登录
+  for (const token in db.sessions) {
+    if (db.sessions[token].username === username) delete db.sessions[token];
+  }
+  writeDB(db);
+  res.json({ success: true });
+});
+
 app.get('/api/sync', requireAuth, (req, res) => {
   const db = readDB();
   const user = db.users[req.username];
