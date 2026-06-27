@@ -2,17 +2,16 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { MongoClient } = require('mongodb');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ===== 存储后端选择 =====
-const MONGO_URI = process.env.MONGO_URI || '';
-const USE_MONGO = !!MONGO_URI;
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const USE_PG = !!DATABASE_URL;
 
-let mongoClient = null;
-let db = null;
+let pool = null;
 
 // 文件存储备用（本地开发）
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -29,55 +28,88 @@ function readDB() {
 }
 function writeDB(dbData) { fs.writeFileSync(DB_FILE, JSON.stringify(dbData, null, 2)); }
 
-// ===== MongoDB 存储 =====
-async function getUsersCollection() {
-  return db.collection('users');
-}
-async function getSessionsCollection() {
-  return db.collection('sessions');
+// ===== PostgreSQL 存储 =====
+async function initPG() {
+  pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+  // 创建 users 表
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      username VARCHAR(50) PRIMARY KEY,
+      password VARCHAR(128) NOT NULL,
+      partner VARCHAR(50),
+      records TEXT DEFAULT '[]',
+      net_assets TEXT DEFAULT '{"deposit":0,"investments":[],"lastUpdate":""}',
+      config TEXT DEFAULT '{"inflationRate":0.03,"returnRate":0.07}',
+      created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()) * 1000
+    )
+  `);
+
+  // 创建 sessions 表
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token VARCHAR(128) PRIMARY KEY,
+      username VARCHAR(50) NOT NULL,
+      created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()) * 1000
+    )
+  `);
+
+  console.log('✅ PostgreSQL 连接成功，表已就绪');
 }
 
 // 清理过期session (>30天)
-async function cleanSessionsMongo() {
-  const sessions = await getSessionsCollection();
+async function cleanSessionsPG() {
   const expiry = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  await sessions.deleteMany({ createdAt: { $lt: expiry } });
+  await pool.query('DELETE FROM sessions WHERE created_at < $1', [expiry]);
 }
 async function cleanSessionsFile() {
   const dbData = readDB();
-  const now = Date.now();
   const expiry = 30 * 24 * 60 * 60 * 1000;
   for (const token in dbData.sessions) {
-    if (now - dbData.sessions[token].createdAt > expiry) delete dbData.sessions[token];
+    if (Date.now() - dbData.sessions[token].createdAt > expiry) delete dbData.sessions[token];
   }
   writeDB(dbData);
 }
-
 async function cleanSessions() {
-  if (USE_MONGO) await cleanSessionsMongo();
+  if (USE_PG) await cleanSessionsPG();
   else cleanSessionsFile();
 }
 
 // ===== 统一用户操作接口 =====
 async function findUser(username) {
-  if (USE_MONGO) {
-    const users = await getUsersCollection();
-    return users.findOne({ _id: username });
+  if (USE_PG) {
+    const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    if (r.rows.length === 0) return null;
+    const u = r.rows[0];
+    return {
+      username: u.username,
+      password: u.password,
+      partner: u.partner,
+      records: JSON.parse(u.records || '[]'),
+      netAssets: JSON.parse(u.net_assets || '{"deposit":0,"investments":[],"lastUpdate":""}'),
+      config: JSON.parse(u.config || '{"inflationRate":0.03,"returnRate":0.07}')
+    };
   } else {
     const dbData = readDB();
-    return dbData.users[username] ? { _id: username, ...dbData.users[username] } : null;
+    return dbData.users[username] ? { username, ...dbData.users[username] } : null;
   }
 }
 
 async function saveUser(username, userData) {
-  if (USE_MONGO) {
-    const users = await getUsersCollection();
-    const { _id, ...data } = userData; // 去掉 _id，MongoDB 不允许 $set _id
-    await users.updateOne(
-      { _id: username },
-      { $set: data },
-      { upsert: true }
-    );
+  if (USE_PG) {
+    const records = JSON.stringify(userData.records || []);
+    const netAssets = JSON.stringify(userData.netAssets || { deposit: 0, investments: [], lastUpdate: '' });
+    const config = JSON.stringify(userData.config || { inflationRate: 0.03, returnRate: 0.07 });
+    await pool.query(`
+      INSERT INTO users (username, password, partner, records, net_assets, config)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (username) DO UPDATE SET
+        password = EXCLUDED.password,
+        partner = EXCLUDED.partner,
+        records = EXCLUDED.records,
+        net_assets = EXCLUDED.net_assets,
+        config = EXCLUDED.config
+    `, [username, userData.password, userData.partner || null, records, netAssets, config]);
   } else {
     const dbData = readDB();
     dbData.users[username] = userData;
@@ -86,9 +118,8 @@ async function saveUser(username, userData) {
 }
 
 async function deleteUser(username) {
-  if (USE_MONGO) {
-    const users = await getUsersCollection();
-    await users.deleteOne({ _id: username });
+  if (USE_PG) {
+    await pool.query('DELETE FROM users WHERE username = $1', [username]);
   } else {
     const dbData = readDB();
     delete dbData.users[username];
@@ -97,24 +128,26 @@ async function deleteUser(username) {
 }
 
 async function findSession(token) {
-  if (USE_MONGO) {
-    const sessions = await getSessionsCollection();
-    return sessions.findOne({ _id: token });
+  if (USE_PG) {
+    const r = await pool.query('SELECT * FROM sessions WHERE token = $1', [token]);
+    if (r.rows.length === 0) return null;
+    const s = r.rows[0];
+    return { token: s.token, username: s.username, createdAt: parseInt(s.created_at) };
   } else {
     const dbData = readDB();
-    return dbData.sessions[token] ? { _id: token, ...dbData.sessions[token] } : null;
+    return dbData.sessions[token] ? { token, ...dbData.sessions[token] } : null;
   }
 }
 
 async function saveSession(token, sessionData) {
-  if (USE_MONGO) {
-    const sessions = await getSessionsCollection();
-    const { _id, ...data } = sessionData;
-    await sessions.updateOne(
-      { _id: token },
-      { $set: data },
-      { upsert: true }
-    );
+  if (USE_PG) {
+    await pool.query(`
+      INSERT INTO sessions (token, username, created_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (token) DO UPDATE SET
+        username = EXCLUDED.username,
+        created_at = EXCLUDED.created_at
+    `, [token, sessionData.username, sessionData.createdAt]);
   } else {
     const dbData = readDB();
     dbData.sessions[token] = sessionData;
@@ -123,9 +156,8 @@ async function saveSession(token, sessionData) {
 }
 
 async function deleteSession(token) {
-  if (USE_MONGO) {
-    const sessions = await getSessionsCollection();
-    await sessions.deleteOne({ _id: token });
+  if (USE_PG) {
+    await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
   } else {
     const dbData = readDB();
     delete dbData.sessions[token];
@@ -134,10 +166,9 @@ async function deleteSession(token) {
 }
 
 async function getAllSessionsForUser(username) {
-  if (USE_MONGO) {
-    const sessions = await getSessionsCollection();
-    const docs = await sessions.find({ username }).toArray();
-    return docs.map(d => d._id);
+  if (USE_PG) {
+    const r = await pool.query('SELECT token FROM sessions WHERE username = $1', [username]);
+    return r.rows.map(row => row.token);
   } else {
     const dbData = readDB();
     return Object.keys(dbData.sessions).filter(t => dbData.sessions[t].username === username);
@@ -160,24 +191,14 @@ async function requireAuth(req, res, next) {
 
 // ===== 初始化 =====
 async function initStorage() {
-  if (USE_MONGO) {
-    mongoClient = new MongoClient(MONGO_URI);
-    await mongoClient.connect();
-    db = mongoClient.db('fire_ledger');
-    console.log('✅ MongoDB Atlas 连接成功');
-
-    // 创建索引
-    const sessions = await getSessionsCollection();
-    await sessions.createIndex({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
-
-    const users = await getUsersCollection();
-    await users.createIndex({ _id: 1 });
+  if (USE_PG) {
+    await initPG();
   } else {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     if (!fs.existsSync(DB_FILE)) {
       fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, sessions: {} }, null, 2));
     }
-    console.log('⚠️  使用本地文件存储（非持久化），生产环境请设置 MONGO_URI');
+    console.log('⚠️  使用本地文件存储（非持久化），生产环境请设置 DATABASE_URL');
   }
 }
 
@@ -272,6 +293,45 @@ app.post('/api/sync', requireAuth, async (req, res) => {
   if (config !== undefined) user.config = config;
   await saveUser(req.username, user);
   res.json({ success: true });
+});
+
+// 导出数据
+app.get('/api/export', requireAuth, async (req, res) => {
+  const user = await findUser(req.username);
+  if (!user) return res.status(404).json({ error: '用户不存在' });
+
+  const exportData = {
+    version: '1.0',
+    exportTime: new Date().toISOString(),
+    username: req.username,
+    records: user.records || [],
+    netAssets: user.netAssets || { deposit: 0, investments: [], lastUpdate: '' },
+    config: user.config || { inflationRate: 0.03, returnRate: 0.07 },
+    partner: user.partner || null
+  };
+
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="fire-ledger-${req.username}-${new Date().toISOString().slice(0,10)}.json"`);
+  res.json(exportData);
+});
+
+// 导入数据
+app.post('/api/import', requireAuth, async (req, res) => {
+  const { records, netAssets, config } = req.body;
+  if (!records) return res.status(400).json({ error: '无效的导入数据' });
+
+  const user = await findUser(req.username);
+  if (!user) return res.status(404).json({ error: '用户不存在' });
+
+  // 合并数据：保留本地没有的记录
+  const existingIds = new Set((user.records || []).map(r => r.id));
+  const newRecords = (records || []).filter(r => !existingIds.has(r.id));
+  user.records = [...(user.records || []), ...newRecords];
+  if (netAssets !== undefined) user.netAssets = netAssets;
+  if (config !== undefined) user.config = config;
+  await saveUser(req.username, user);
+
+  res.json({ success: true, imported: newRecords.length });
 });
 
 // 绑定对象

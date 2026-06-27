@@ -272,6 +272,22 @@ body{background:#0f0f23;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 </style>
 </head>
 <body>
+<!-- 设置弹窗（导出/导入数据） -->
+<div id="settingsModal" class="modal-mask" style="display:none" onclick="if(event.target===this)hideSettings()">
+  <div class="modal-content" style="max-width:340px">
+    <div class="modal-title">设置 / 数据管理</div>
+    <div style="padding:16px 20px">
+      <div style="margin-bottom:18px">
+        <div style="font-size:13px;color:#8888aa;margin-bottom:8px">当前用户：<span id="settingsUser" style="color:#e0e0e0"></span></div>
+      </div>
+      <button class="auth-btn" style="background:#0f9d58;margin-bottom:10px" onclick="exportData()">📤 导出数据（JSON备份）</button>
+      <button class="auth-btn" style="background:#1a73e8;margin-bottom:10px" onclick="document.getElementById('importFile').click()">📥 导入数据（恢复备份）</button>
+      <input type="file" id="importFile" accept=".json" style="display:none" onchange="importData(event)">
+      <button class="auth-btn-secondary" onclick="hideSettings()" style="margin-top:8px">关闭</button>
+    </div>
+  </div>
+</div>
+
 <!-- 微信内置浏览器提示 -->
 <div id="wechatTip" class="wechat-tip">
   点右上角 <b>···</b> 选择「在浏览器中打开」，可安装到桌面获得APP体验
@@ -317,6 +333,8 @@ body{background:#0f0f23;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 
 <!-- 同步状态指示 -->
 <div id="syncIndicator" class="sync-indicator sync-idle" style="display:none"></div>
+<!-- 设置按钮（右上角） -->
+<div id="settingsBtn" style="display:none;position:fixed;top:8px;right:8px;z-index:5000;cursor:pointer;font-size:20px;background:#16213e;padding:6px 10px;border-radius:8px;border:1px solid #2a2a4a" onclick="showSettings()">⚙️</div>
 
 <!-- 总览页 -->
 <div id="page-overview" class="page active">
@@ -3377,6 +3395,7 @@ function init() {
 
 // 初始化界面UI
 function startAppUI() {
+  document.getElementById('settingsBtn').style.display = 'block';
   document.getElementById('recordDate').value = new Date().toISOString().slice(0,10);
   document.getElementById('myCode').textContent = CloudSync.isLoggedIn() ? cloudUser : appData.myCode;
   renderCategories();
@@ -3399,6 +3418,110 @@ window.addEventListener('resize', function() {
     }
   }, 200);
 });
+
+// ===== 设置 / 导出导入 =====
+function showSettings() {
+  document.getElementById('settingsUser').textContent = CloudSync.isLoggedIn() ? cloudUser : '离线模式';
+  document.getElementById('settingsModal').style.display = 'flex';
+}
+function hideSettings() {
+  document.getElementById('settingsModal').style.display = 'none';
+}
+
+function exportData() {
+  if (CloudSync.isLoggedIn()) {
+    showSyncIndicator('down', '导出中↓');
+    fetch(API_BASE + '/api/export', {
+      headers: { 'Authorization': 'Bearer ' + cloudToken }
+    }).then(function(r) { return r.json(); }).then(function(data) {
+      downloadJSON(data, 'fire-ledger-' + cloudUser + '-' + new Date().toISOString().slice(0,10) + '.json');
+      hideSyncIndicator();
+      hideSettings();
+    }).catch(function() {
+      // 如果云端导出失败，导出本地数据
+      exportLocalData();
+    });
+  } else {
+    exportLocalData();
+  }
+}
+
+function exportLocalData() {
+  var exportData = {
+    version: '1.0',
+    exportTime: new Date().toISOString(),
+    records: appData.records || [],
+    netAssets: { deposit: appData.assets.length ? appData.assets[appData.assets.length-1].amount : 0, investments: appData.investments || [], lastUpdate: appData.assets.length ? appData.assets[appData.assets.length-1].date : '' },
+    config: appData.config || { inflationRate: 0.03, returnRate: 0.07 },
+    partner: appData.partnerCode || null
+  };
+  downloadJSON(exportData, 'fire-ledger-local-' + new Date().toISOString().slice(0,10) + '.json');
+  hideSettings();
+}
+
+function downloadJSON(data, filename) {
+  var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function importData(event) {
+  var file = event.target.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      var data = JSON.parse(e.target.result);
+      if (!data.records) { alert('无效的数据文件'); return; }
+      if (CloudSync.isLoggedIn()) {
+        showSyncIndicator('up', '导入中↑');
+        fetch(API_BASE + '/api/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cloudToken },
+          body: JSON.stringify({ records: data.records, netAssets: data.netAssets, config: data.config })
+        }).then(function(r) { return r.json(); }).then(function(d) {
+          hideSyncIndicator();
+          if (d.success) {
+            alert('导入成功！已合并 ' + d.imported + ' 条新记录');
+            CloudSync.syncDown().then(function() { refreshOverview(); refreshFire(); });
+          } else {
+            alert('导入失败：' + (d.error || '未知错误'));
+          }
+          hideSettings();
+        }).catch(function() { importLocalData(data); });
+      } else {
+        importLocalData(data);
+      }
+    } catch (err) {
+      alert('文件格式错误：' + err.message);
+    }
+  };
+  reader.readAsText(file);
+  event.target.value = '';
+}
+
+function importLocalData(data) {
+  var existingIds = new Set(appData.records.map(function(r) { return r.id; }));
+  var newRecords = (data.records || []).filter(function(r) { return !existingIds.has(r.id); });
+  appData.records = appData.records.concat(newRecords);
+  if (data.netAssets) {
+    appData.assets = appData.assets || [];
+    if (appData.assets.length === 0) {
+      appData.assets.push({ date: data.netAssets.lastUpdate || new Date().toISOString().slice(0,10), amount: data.netAssets.deposit || 0 });
+    }
+    appData.investments = data.netAssets.investments || [];
+  }
+  if (data.config) appData.config = data.config;
+  saveData(appData);
+  alert('导入成功！已合并 ' + newRecords.length + ' 条新记录');
+  refreshOverview(); refreshFire();
+  hideSettings();
+}
 
 // ===== PWA: Service Worker Registration =====
 if ('serviceWorker' in navigator) {

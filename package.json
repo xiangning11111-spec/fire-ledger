@@ -1,13 +1,16 @@
 {
-  "name": "fire-ledger",
+  "name": "fire-ledger-server",
   "version": "1.0.0",
-  "description": "FIRE记账 - 前端+后端一体化部署（支持MongoDB持久化）",
+  "description": "FIRE记账后端服务",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "mongodb": "^6.0.0"
+    "pg": "^8.11.3",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "cors": "^2.8.5"
   }
 }
